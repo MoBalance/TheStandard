@@ -1,0 +1,262 @@
+name: Release
+
+# Publishes the `the-standard-service` binaries that GhostReveal installers and
+# RSLLM bundles consume. The asset names are a hardcoded contract in those
+# repositories, so nothing in this file may rename them casually:
+#
+#   the-standard-service-<target>[.exe]
+#   SHA256SUMS
+#   the-standard-release.json
+#
+# Tag rule (README "Current version matrix"): versions are monotonic and a tag
+# is exactly `v<workspace version>`. `verify` fails the whole run before any
+# build starts when the pushed tag does not match Cargo.toml.
+#
+# `workflow_dispatch` can build an arbitrary branch/SHA (input `ref`); in that
+# case the tag is derived from the workspace version instead of being checked
+# against the pushed tag, and the release is created at that commit.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag or SHA) to build and publish"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # No `rust-version` is declared in Cargo.toml and the README has no MSRV row;
+  # edition 2024 needs >= 1.85 and local development uses 1.93.1. Pin it so
+  # every asset is produced by the same compiler.
+  RUST_TOOLCHAIN: "1.93.1"
+  SERVICE_CRATE: the-standard-service
+  SERVICE_BINARY: the-standard-service
+
+jobs:
+  verify:
+    name: Verify version, tag and schema constants
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Check out the release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # Fails when the tag is not exactly `v<workspace version>`, when a crate
+      # version drifted from the workspace version, or when the README version
+      # matrix disagrees with the constants in
+      # crates/the-standard-contracts/src/lib.rs.
+      - name: Derive release identity
+        id: release
+        run: |
+          python3 .github/scripts/release.py check-tag \
+            --workspace . \
+            --ref "${{ github.event.inputs.ref || github.ref }}" \
+            --event "${{ github.event_name }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    # No cross-compilation for the four native targets. aarch64-unknown-linux-gnu
+    # is the exception: `ring` compiles C and assembly, so it needs an aarch64
+    # GCC/binutils toolchain that the ubuntu runner does not have. The
+    # houseabsolute/actions-rust-cross action drives `cross`, whose
+    # `cross-rs/aarch64-unknown-linux-gnu` container image ships exactly that
+    # toolchain; a plain `cargo build` on ubuntu-latest cannot link this target.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            method: cargo
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            method: cross
+          - target: x86_64-apple-darwin
+            # macos-13 is the x86_64 image. If GitHub retires the label, switch
+            # to macos-15-intel (also Intel) in this one line.
+            os: macos-13
+            method: cargo
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            method: cargo
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            method: cargo
+    steps:
+      - name: Check out the release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Assert the runner architecture matches the target
+        if: matrix.method == 'cargo'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          host="$(uname -m)"
+          case "$target" in
+            x86_64-*) expected=x86_64 ;;
+            aarch64-*) expected=arm64 ;;
+            *) echo "unknown target $target"; exit 1 ;;
+          esac
+          if [ "$expected" = arm64 ]; then
+            [ "$host" = arm64 ] || [ "$host" = aarch64 ] || { echo "runner $host cannot natively build $target"; exit 1; }
+          else
+            [ "$host" = x86_64 ] || [ "$host" = AMD64 ] || { echo "runner $host cannot natively build $target"; exit 1; }
+          fi
+          echo "runner $host builds $target natively"
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        if: matrix.method == 'cargo'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build (native cargo)
+        if: matrix.method == 'cargo'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p "$SERVICE_CRATE" --target "${{ matrix.target }}"
+
+      - name: Build (cross)
+        if: matrix.method == 'cross'
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          args: --release --locked -p the-standard-service
+
+      # Asset name contract: the-standard-service-<target><ext>, where <ext> is
+      # `.exe` for *-windows-msvc and empty for every other target.
+      - name: Stage the release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          ext=""
+          case "$target" in
+            *-windows-msvc) ext=".exe" ;;
+          esac
+          asset="$SERVICE_BINARY-$target$ext"
+          src="$(find target -type f -path "*/release/$SERVICE_BINARY$ext" -print -quit)"
+          if [ -z "$src" ]; then
+            echo "no release build of $SERVICE_BINARY$ext for $target in target/"
+            find target -maxdepth 4 -type f -name "$SERVICE_BINARY$ext" || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$src" "dist/$asset"
+          test -s "dist/$asset"
+          case "$(uname -s)" in
+            Darwin) shasum -a 256 "dist/$asset" ;;
+            *) sha256sum "dist/$asset" ;;
+          esac
+          ls -l "dist/$asset"
+
+      - name: Upload the asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Download every asset
+        uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+
+      # Recomputes the version/schema constants from the released commit (never
+      # from stale literals), refuses a tag that is not v<workspace version>,
+      # requires exactly the five contract targets, and writes
+      # the-standard-release.json, SHA256SUMS and the release notes.
+      - name: Build SHA256SUMS, the-standard-release.json and release notes
+        run: |
+          python3 .github/scripts/release.py package \
+            --workspace . \
+            --dist dist \
+            --tag "${{ needs.verify.outputs.tag }}" \
+            --commit "${{ needs.verify.outputs.commit }}" \
+            --notes-out "${{ runner.temp }}/release-notes.md" \
+            --expect-target x86_64-unknown-linux-gnu \
+            --expect-target aarch64-unknown-linux-gnu \
+            --expect-target x86_64-apple-darwin \
+            --expect-target aarch64-apple-darwin \
+            --expect-target x86_64-pc-windows-msvc
+
+      - name: Verify the checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Show the release manifest
+        run: cat dist/the-standard-release.json
+
+      # Re-running a failed workflow uploads over the existing release with
+      # --clobber; it never creates a second release for the same tag, and the
+      # tag/version guard above still refuses a reused version number.
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; replacing its assets"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "${{ needs.verify.outputs.commit }}" \
+              --title "法仪 TheStandard $TAG" \
+              --notes-file "${{ runner.temp }}/release-notes.md"
+          fi

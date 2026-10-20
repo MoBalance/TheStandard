@@ -1,0 +1,47 @@
+[service]
+host = "0.0.0.0"
+port = 8081
+require_auth = false
+allow_private_targets = false
+allowed_origins = ["http://localhost:5174", "http://127.0.0.1:5174"]
+# Origins listed here use the deterministic DemoTransport. Keep production lists empty.
+demo_targets = ["https://demo.the-standard.dev"]
+max_inflight_detections = 8
+max_request_body_bytes = 2097152
+shutdown_grace_seconds = 30
+target_dns_timeout_seconds = 5
+# Fixed-window per-IP limit on the detection entry points (POST /v1/detect,
+# POST /v1/detect/jobs and the core.detect JSON-RPC method). 0 disables it,
+# which is the default and keeps existing deployments unchanged. The key is the
+# peer SocketAddr of the connection; X-Forwarded-For and similar headers are
+# never trusted, so a proxy must terminate connections and limit on its side.
+# Override with THE_STANDARD_SERVICE_PER_IP_DETECT_REQUESTS_PER_MINUTE (0..60000).
+per_ip_detect_requests_per_minute = 0
+# Hard cap on the number of tracked client IPs (one small counter each). Idle
+# entries are retired oldest-first, so a spoofed-IP flood rotates the map
+# instead of growing it. Override with
+# THE_STANDARD_SERVICE_RATE_LIMIT_MAX_ENTRIES (1..1048576).
+rate_limit_max_entries = 4096
+
+[engine]
+request_timeout_seconds = 30
+max_retries = 3
+retry_backoff_milliseconds = 1000
+max_concurrent = 3
+quick_timeout_seconds = 60
+standard_timeout_seconds = 120
+full_timeout_seconds = 180
+
+[transport]
+max_response_bytes = 4194304
+max_stream_bytes = 4194304
+max_stream_events = 10000
+
+[rules]
+manifest_url = "https://raw.githubusercontent.com/MoBalance/SanBiao/main/manifest.json"
+fallback_directory = "../SanBiao"
+allow_insecure_http = false
+refresh_seconds = 300
+request_timeout_seconds = 5
+max_manifest_bytes = 262144
+max_document_bytes = 1048576

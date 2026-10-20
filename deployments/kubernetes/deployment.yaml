@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: the-standard
+  namespace: the-standard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: the-standard
+  template:
+    metadata:
+      labels:
+        app: the-standard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: the-standard
+          image: the-standard-service:0.1.1015
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: THE_STANDARD_HOST
+              value: 0.0.0.0
+            - name: THE_STANDARD_PORT
+              value: "8081"
+            - name: THE_STANDARD_REQUIRE_AUTH
+              value: "true"
+            - name: THE_STANDARD_ALLOW_PRIVATE_TARGETS
+              value: "false"
+            - name: THE_STANDARD_DEMO_TARGETS
+              value: ""
+            - name: THE_STANDARD_SERVICE_MAX_INFLIGHT_DETECTIONS
+              value: "8"
+            - name: THE_STANDARD_SERVICE_MAX_REQUEST_BODY_BYTES
+              value: "2097152"
+            - name: THE_STANDARD_SERVICE_SHUTDOWN_GRACE_SECONDS
+              value: "30"
+            - name: THE_STANDARD_SERVICE_TARGET_DNS_TIMEOUT_SECONDS
+              value: "5"
+            - name: THE_STANDARD_ENGINE_REQUEST_TIMEOUT_SECONDS
+              value: "30"
+            - name: THE_STANDARD_ENGINE_MAX_RETRIES
+              value: "3"
+            - name: THE_STANDARD_ENGINE_RETRY_BACKOFF_MILLISECONDS
+              value: "1000"
+            - name: THE_STANDARD_ENGINE_MAX_CONCURRENT
+              value: "3"
+            - name: THE_STANDARD_ENGINE_QUICK_TIMEOUT_SECONDS
+              value: "60"
+            - name: THE_STANDARD_ENGINE_STANDARD_TIMEOUT_SECONDS
+              value: "120"
+            - name: THE_STANDARD_ENGINE_FULL_TIMEOUT_SECONDS
+              value: "180"
+            - name: THE_STANDARD_TRANSPORT_MAX_RESPONSE_BYTES
+              value: "4194304"
+            - name: THE_STANDARD_TRANSPORT_MAX_STREAM_BYTES
+              value: "4194304"
+            - name: THE_STANDARD_TRANSPORT_MAX_STREAM_EVENTS
+              value: "10000"
+            - name: THE_STANDARD_RULE_MANIFEST_URL
+              value: https://raw.githubusercontent.com/MoBalance/SanBiao/main/manifest.json
+            - name: THE_STANDARD_RULE_REFRESH_SECONDS
+              value: "300"
+            - name: THE_STANDARD_RULE_REQUEST_TIMEOUT_SECONDS
+              value: "5"
+            - name: THE_STANDARD_RULE_MAX_MANIFEST_BYTES
+              value: "262144"
+            - name: THE_STANDARD_RULE_MAX_DOCUMENT_BYTES
+              value: "1048576"
+            - name: THE_STANDARD_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: the-standard-auth
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

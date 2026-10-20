@@ -1,0 +1,27 @@
+[package]
+name = "the-standard"
+description = "Fa Yi model-probe orchestration and evidence scoring engine"
+version = "0.1.1015"
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/MoBalance/TheStandard"
+readme = "../../README.md"
+
+[dependencies]
+async-trait.workspace = true
+base64 = "0.22"
+chrono.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+wire-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

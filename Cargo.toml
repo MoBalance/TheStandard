@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/the-standard-contracts",
+    "crates/the-standard",
+    "crates/the-standard-service",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1015"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["TheStandard contributors"]
+repository = "https://github.com/MoBalance/TheStandard"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = { version = "1.2", features = ["serde"] }
+url = { version = "2.5", features = ["serde"] }
+wire-contracts = { package = "the-standard-contracts", path = "crates/the-standard-contracts" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,134 @@
+# docker-compose.lite.yml - single-host "lite" stack for the detection ecosystem.
+#
+# Contents: the core detection service (the-standard) + the GhostReveal archive
+# server (ghost-reveal-server) + the GhostReveal static frontend (ghost-reveal-frontend).
+# No external database, no cache, no queue: the only persisted state is the named
+# volume `ghost-reveal-data` (archived reports + feedback).
+#
+# Run from this directory (TheStandard):
+#   docker compose -f docker-compose.lite.yml up -d --build
+#
+# Build contexts are relative to this file:
+#   the-standard            -> context: .            (TheStandard)
+#   ghost-reveal-server     -> context: ../GhostReveal
+#   ghost-reveal-frontend   -> context: ../GhostReveal
+#
+# Every published port is bound to 127.0.0.1 by default. Put a TLS-terminating
+# reverse proxy in front for anything that must leave the host (see
+# deployments/lite/README.md).
+#
+# Ports follow the single source of truth (docs/ecosystem-architecture.md section 9):
+#   8081 the-standard-service  8090 ghost-reveal-server  3001 -> 8080 static frontend
+
+name: the-standard-lite
+
+services:
+  # L2: detection engine. Image name/tag mirrors TheStandard/docker-compose.yml.
+  the-standard:
+    image: the-standard-service:0.1.1015
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+    environment:
+      THE_STANDARD_CONFIG_FILE: /etc/the-standard/the-standard.toml
+      THE_STANDARD_AUTH_TOKEN: ${THE_STANDARD_AUTH_TOKEN:-}
+      THE_STANDARD_REQUIRE_AUTH: ${THE_STANDARD_REQUIRE_AUTH:-false}
+      THE_STANDARD_ALLOWED_ORIGINS: ${THE_STANDARD_ALLOWED_ORIGINS:-http://localhost:3001,http://127.0.0.1:3001,http://localhost:8090,http://127.0.0.1:8090,http://localhost:5174,http://127.0.0.1:5174}
+      THE_STANDARD_ALLOW_PRIVATE_TARGETS: ${THE_STANDARD_ALLOW_PRIVATE_TARGETS:-false}
+      THE_STANDARD_DEMO_TARGETS: ${THE_STANDARD_DEMO_TARGETS:-}
+      THE_STANDARD_SERVICE_MAX_INFLIGHT_DETECTIONS: ${THE_STANDARD_SERVICE_MAX_INFLIGHT_DETECTIONS:-8}
+      THE_STANDARD_SERVICE_MAX_REQUEST_BODY_BYTES: ${THE_STANDARD_SERVICE_MAX_REQUEST_BODY_BYTES:-2097152}
+      THE_STANDARD_SERVICE_SHUTDOWN_GRACE_SECONDS: ${THE_STANDARD_SERVICE_SHUTDOWN_GRACE_SECONDS:-30}
+      THE_STANDARD_SERVICE_TARGET_DNS_TIMEOUT_SECONDS: ${THE_STANDARD_SERVICE_TARGET_DNS_TIMEOUT_SECONDS:-5}
+      THE_STANDARD_ENGINE_REQUEST_TIMEOUT_SECONDS: ${THE_STANDARD_ENGINE_REQUEST_TIMEOUT_SECONDS:-30}
+      THE_STANDARD_ENGINE_MAX_RETRIES: ${THE_STANDARD_ENGINE_MAX_RETRIES:-3}
+      THE_STANDARD_ENGINE_RETRY_BACKOFF_MILLISECONDS: ${THE_STANDARD_ENGINE_RETRY_BACKOFF_MILLISECONDS:-1000}
+      THE_STANDARD_ENGINE_MAX_CONCURRENT: ${THE_STANDARD_ENGINE_MAX_CONCURRENT:-3}
+      THE_STANDARD_ENGINE_QUICK_TIMEOUT_SECONDS: ${THE_STANDARD_ENGINE_QUICK_TIMEOUT_SECONDS:-60}
+      THE_STANDARD_ENGINE_STANDARD_TIMEOUT_SECONDS: ${THE_STANDARD_ENGINE_STANDARD_TIMEOUT_SECONDS:-120}
+      THE_STANDARD_ENGINE_FULL_TIMEOUT_SECONDS: ${THE_STANDARD_ENGINE_FULL_TIMEOUT_SECONDS:-180}
+      THE_STANDARD_TRANSPORT_MAX_RESPONSE_BYTES: ${THE_STANDARD_TRANSPORT_MAX_RESPONSE_BYTES:-4194304}
+      THE_STANDARD_TRANSPORT_MAX_STREAM_BYTES: ${THE_STANDARD_TRANSPORT_MAX_STREAM_BYTES:-4194304}
+      THE_STANDARD_TRANSPORT_MAX_STREAM_EVENTS: ${THE_STANDARD_TRANSPORT_MAX_STREAM_EVENTS:-10000}
+      THE_STANDARD_RULE_MANIFEST_URL: ${THE_STANDARD_RULE_MANIFEST_URL:-https://raw.githubusercontent.com/MoBalance/SanBiao/main/manifest.json}
+      THE_STANDARD_RULE_SOURCE_REVISION: ${THE_STANDARD_RULE_SOURCE_REVISION:-}
+      THE_STANDARD_RULE_SOURCE_ALLOW_INSECURE_HTTP: ${THE_STANDARD_RULE_SOURCE_ALLOW_INSECURE_HTTP:-false}
+      THE_STANDARD_RULE_REFRESH_SECONDS: ${THE_STANDARD_RULE_REFRESH_SECONDS:-300}
+      THE_STANDARD_RULE_REQUEST_TIMEOUT_SECONDS: ${THE_STANDARD_RULE_REQUEST_TIMEOUT_SECONDS:-5}
+      THE_STANDARD_RULE_MAX_MANIFEST_BYTES: ${THE_STANDARD_RULE_MAX_MANIFEST_BYTES:-262144}
+      THE_STANDARD_RULE_MAX_DOCUMENT_BYTES: ${THE_STANDARD_RULE_MAX_DOCUMENT_BYTES:-1048576}
+      RUST_LOG: the_standard_service=info,tower_http=info
+    ports:
+      - "127.0.0.1:${THE_STANDARD_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8081/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # L3: archive server. Serves /api/reports (+ feedback, once the batch lands),
+  # /config.js and the same-origin /core proxy.
+  ghost-reveal-server:
+    build:
+      context: ../GhostReveal
+      dockerfile: deployments/docker/server.Dockerfile
+    environment:
+      GHOST_REVEAL_CONFIG: /app/config.runtime.toml
+      RUST_LOG: ghost_reveal_server=info,tower_http=info
+    # The checked-in GhostReveal/config.toml targets the desktop/loopback layout
+    # (bind 127.0.0.1, proxy /core to 127.0.0.1:8081). In this stack the archive
+    # must answer the host port mapping and reach the core by service name, so a
+    # runtime copy is derived from the mounted file. The checked-in file is never
+    # modified; every other key (retention_days, share_ttl_hours,
+    # feedback_directory, ...) is taken verbatim.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        sed \
+          -e 's#^\( *host *= *\)"[0-9.]*"#\1"0.0.0.0"#' \
+          -e 's#^\( *upstream_url *= *\)".*"#\1"http://the-standard:8081"#' \
+          /app/config.toml > /app/config.runtime.toml
+        exec /usr/local/bin/ghost-reveal-server
+    ports:
+      - "127.0.0.1:${GHOST_REVEAL_SERVER_PORT:-8090}:8090"
+    volumes:
+      - ../GhostReveal/config.toml:/app/config.toml:ro
+      - ghost-reveal-data:/app/data
+    depends_on:
+      the-standard:
+        condition: service_healthy
+    healthcheck:
+      # debian:bookworm-slim has neither curl nor wget; bash /dev/tcp is enough
+      # to prove the listener is accepting connections.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8090"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # L3: static frontend (nginx). Proxies /core/* to the-standard:8081/* same-origin.
+  ghost-reveal-frontend:
+    build:
+      context: ../GhostReveal
+      dockerfile: deployments/docker/Dockerfile
+    ports:
+      - "127.0.0.1:${GHOST_REVEAL_PORT:-3001}:8080"
+    depends_on:
+      the-standard:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  # Reports (storage.report_directory) and feedback (storage.feedback_directory)
+  # both live under /app/data inside the container.
+  ghost-reveal-data:
