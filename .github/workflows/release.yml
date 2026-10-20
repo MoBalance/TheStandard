@@ -97,9 +97,9 @@ jobs:
             os: ubuntu-latest
             method: cross
           - target: x86_64-apple-darwin
-            # macos-13 is the x86_64 image. If GitHub retires the label, switch
-            # to macos-15-intel (also Intel) in this one line.
-            os: macos-13
+            # Intel macOS. `macos-13` was retired, which left this job queued
+            # forever; `macos-15-intel` is the current x86_64 hosted image.
+            os: macos-15-intel
             method: cargo
           - target: aarch64-apple-darwin
             os: macos-latest
