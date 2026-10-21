@@ -345,6 +345,8 @@ fn overview_view(report: &DetectionReport) -> PresentationView {
                 ],
                 Vec::new(),
             ),
+            identity_section(report),
+            issues_section(report),
             section(
                 "provenance",
                 "Core provenance",
@@ -638,6 +640,228 @@ fn overview_view(report: &DetectionReport) -> PresentationView {
     }
 }
 
+/// One-decimal percentage: 0.58 must render as 58, not 57.99999999999999, and
+/// 0.12 as 12, not 12.000000000000002.
+fn percent(ratio: f64) -> Value {
+    json!((ratio * 1000.0).round() / 10.0)
+}
+
+/// "Is this really the model it claims to be?" — the question a relay check
+/// exists to answer, so it gets its own section instead of hiding in one cell of
+/// the evidence table. Every value is copied from the `identity` family; nothing
+/// is re-derived here, and a family that did not run yields no claim at all.
+fn identity_section(report: &DetectionReport) -> PresentationSection {
+    let identity = report.evidence.iter().find(|item| item.name == "identity");
+    let empty = std::collections::BTreeMap::new();
+    let details = identity.map_or(&empty, |item| &item.details);
+    let text = |key: &str| details.get(key).and_then(Value::as_str).map(str::to_owned);
+    let flag = |key: &str| details.get(key).and_then(Value::as_bool);
+    let tone = |matches: bool| {
+        Some(if matches {
+            "pass".to_owned()
+        } else {
+            "fail".to_owned()
+        })
+    };
+
+    let mut fields = vec![field(
+        "declared-model",
+        "Declared model",
+        json!(report.target.model),
+        "code",
+        None,
+        Some(
+            "The model name the caller requested. It is the upstream's claim, not an observation.",
+        ),
+        None,
+    )];
+    if let Some(family) = text("expectedModelFamily") {
+        fields.push(field(
+            "observed-family",
+            "Observed family",
+            json!(family),
+            "code",
+            None,
+            Some(
+                "Model family the responses actually behave like, measured by the identity probes.",
+            ),
+            None,
+        ));
+    }
+    if let Some(provider) = text("expectedProvider") {
+        fields.push(field(
+            "observed-provider",
+            "Observed provider",
+            json!(provider),
+            "code",
+            None,
+            Some("Provider the response metadata points at."),
+            None,
+        ));
+    }
+    if let Some(matches) = flag("metadataMatches") {
+        fields.push(field(
+            "metadata-match",
+            "Response metadata",
+            json!(if matches {
+                "matches the request"
+            } else {
+                "contradicts the request"
+            }),
+            "text",
+            None,
+            Some(
+                "Whether reported model ids, providers and headers agree with the requested model.",
+            ),
+            tone(matches),
+        ));
+    }
+    if let Some(declaration) = text("selfReport") {
+        fields.push(field(
+            "self-report",
+            "Self-declaration",
+            json!(declaration),
+            "text",
+            None,
+            Some("What the endpoint says it is when asked directly. A relay can forge this, so it never decides the verdict alone."),
+            None,
+        ));
+    }
+    if let Some(matches) = flag("selfReportMatches") {
+        fields.push(field(
+            "self-report-match",
+            "Self-declaration matches",
+            json!(if matches {
+                "agrees with the request"
+            } else {
+                "contradicts the request"
+            }),
+            "text",
+            None,
+            None,
+            tone(matches),
+        ));
+    }
+    fields.push(field(
+        "identity-verdict",
+        "Identity verdict",
+        identity.map_or_else(|| json!("not assessed"), |item| enum_value(item.status)),
+        "status",
+        None,
+        Some("The identity detector's own verdict and the weight it carries in the total score."),
+        identity.map(|item| enum_string(item.status)),
+    ));
+    if let Some(item) = identity {
+        fields.push(field(
+            "identity-weight",
+            "Identity weight",
+            percent(item.weight),
+            "percentage",
+            Some("%"),
+            Some("How much the identity family contributes to the total score when it runs."),
+            None,
+        ));
+    }
+    section(
+        "identity",
+        "Model identity",
+        Some("Whether the endpoint is the model it claims to be, and which family it actually looks like.".into()),
+        "key_value",
+        fields,
+        Vec::new(),
+    )
+}
+
+/// Every detector that is not a clean pass, repeated at the top of the report.
+/// A bare score is not actionable: this names what went wrong and quotes the
+/// Core explanation for it.
+fn issues_section(report: &DetectionReport) -> PresentationSection {
+    let attention: Vec<_> = report
+        .evidence
+        .iter()
+        .filter(|item| matches!(enum_string(item.status).as_str(), "fail" | "warn" | "error"))
+        .collect();
+    if attention.is_empty() {
+        return section(
+            "issues",
+            "Detectors needing attention",
+            Some("Skipped families were not measurable for this endpoint and are excluded from the score.".into()),
+            "key_value",
+            vec![field(
+                "issues",
+                "Result",
+                json!("No detector reported a failure, a warning or an error."),
+                "text",
+                None,
+                None,
+                Some("pass".to_owned()),
+            )],
+            Vec::new(),
+        );
+    }
+    section(
+        "issues",
+        "Detectors needing attention",
+        Some("Every detector that failed, warned or errored for this endpoint, with the Core explanation. Skipped families are excluded because they were not measurable.".into()),
+        "table",
+        Vec::new(),
+        attention
+            .into_iter()
+            .map(|item| PresentationRow {
+                id: item.name.clone(),
+                status: Some(enum_string(item.status)),
+                fields: vec![
+                    field(
+                        "detector",
+                        "Detector",
+                        json!(item.display_name),
+                        "text",
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "status",
+                        "Status",
+                        enum_value(item.status),
+                        "status",
+                        None,
+                        None,
+                        Some(enum_string(item.status)),
+                    ),
+                    field(
+                        "score",
+                        "Score",
+                        json!(item.score),
+                        "score",
+                        None,
+                        None,
+                        Some(enum_string(item.status)),
+                    ),
+                    field(
+                        "weight",
+                        "Weight",
+                        percent(item.weight),
+                        "percentage",
+                        Some("%"),
+                        None,
+                        None,
+                    ),
+                    field(
+                        "explanation",
+                        "Explanation",
+                        json!(item.summary),
+                        "text",
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            })
+            .collect(),
+    )
+}
+
 fn evidence_view(report: &DetectionReport) -> PresentationView {
     PresentationView {
         id: "evidence".into(),
@@ -713,7 +937,7 @@ fn evidence_view(report: &DetectionReport) -> PresentationView {
                         field(
                             "confidence",
                             "Assessment confidence",
-                            json!(item.confidence.map(|value| value * 100.0)),
+                            item.confidence.map_or(Value::Null, percent),
                             "percentage",
                             Some("%"),
                             None,
@@ -722,7 +946,7 @@ fn evidence_view(report: &DetectionReport) -> PresentationView {
                         field(
                             "weight",
                             "Weight",
-                            json!(item.weight * 100.0),
+                            percent(item.weight),
                             "percentage",
                             Some("%"),
                             None,
