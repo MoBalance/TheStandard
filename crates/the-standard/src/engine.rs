@@ -255,6 +255,7 @@ impl Engine {
                 transport,
                 Arc::clone(&global_backoff),
                 Arc::clone(&concurrency),
+                deadline,
                 observer.clone(),
             ));
         }
@@ -336,6 +337,7 @@ impl Engine {
         transport: &dyn ProbeTransport,
         global_backoff: Arc<Mutex<Option<Instant>>>,
         concurrency: Arc<Semaphore>,
+        overall_deadline: Instant,
         observer: Option<Arc<dyn RuntimeObserver>>,
     ) -> Result<(usize, DetectorEvidence, Vec<ProbeObservation>), CoreError> {
         let strategy_name = strategy.name();
@@ -366,6 +368,7 @@ impl Engine {
                 transport,
                 Arc::clone(&global_backoff),
                 Arc::clone(&concurrency),
+                overall_deadline,
                 observer.clone(),
             )
             .await,
@@ -385,6 +388,7 @@ impl Engine {
                     transport,
                     Arc::clone(&global_backoff),
                     Arc::clone(&concurrency),
+                    overall_deadline,
                     observer.clone(),
                 )
                 .await,
@@ -426,6 +430,7 @@ impl Engine {
         transport: &dyn ProbeTransport,
         global_backoff: Arc<Mutex<Option<Instant>>>,
         concurrency: Arc<Semaphore>,
+        overall_deadline: Instant,
         observer: Option<Arc<dyn RuntimeObserver>>,
     ) -> Vec<Result<ProbeObservation, CoreError>> {
         let mut completed = stream::iter(probes.into_iter().enumerate())
@@ -440,6 +445,7 @@ impl Engine {
                         transport,
                         &global_backoff,
                         &concurrency,
+                        overall_deadline,
                         observer.as_deref(),
                     )
                     .await
@@ -464,6 +470,7 @@ impl Engine {
         transport: &dyn ProbeTransport,
         global_backoff: &Mutex<Option<Instant>>,
         concurrency: &Semaphore,
+        overall_deadline: Instant,
         observer: Option<&dyn RuntimeObserver>,
     ) -> Result<ProbeObservation, CoreError> {
         // A numeric-fingerprint probe is one long completion rather than a small
@@ -476,7 +483,6 @@ impl Engine {
         } else {
             self.config.request_timeout
         };
-        let deadline = Instant::now() + budget;
         let mut last_error = None;
         let mut backoff_count = 0;
         for attempt in 0..=self.config.max_retries {
@@ -497,17 +503,25 @@ impl Engine {
                     ),
                 );
             }
+            // Queueing for a concurrency slot is not this probe's time: wait for
+            // the slot against the overall detection deadline, then start the
+            // request budget. Charging the wait to the probe is what turned a
+            // slow relay into "probe exhausted its 30 s attempt budget" across
+            // every strategy at once, which emptied the report.
+            let permit =
+                match tokio::time::timeout_at(overall_deadline, concurrency.acquire()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(error)) => return Err(CoreError::Transport(error.to_string())),
+                    Err(_) => break,
+                };
+            let deadline = (Instant::now() + budget).min(overall_deadline);
             if tokio::time::timeout_at(deadline, wait_for_backoff(global_backoff))
                 .await
                 .is_err()
             {
+                drop(permit);
                 break;
             }
-            let permit = match tokio::time::timeout_at(deadline, concurrency.acquire()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(error)) => return Err(CoreError::Transport(error.to_string())),
-                Err(_) => break,
-            };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 drop(permit);

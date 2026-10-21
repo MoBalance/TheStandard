@@ -182,7 +182,7 @@ impl Default for EngineConfig {
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
-            max_concurrent: 3,
+            max_concurrent: 8,
             quick_timeout: Duration::from_secs(60),
             standard_timeout: Duration::from_secs(120),
             full_timeout: Duration::from_secs(180),

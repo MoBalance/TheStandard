@@ -3137,7 +3137,12 @@ mod tests {
             sanbiao_manifest()["coreRules"]["version"]
         );
         assert_eq!(body["runtime"]["engine"]["requestTimeoutMs"], 30_000);
-        assert_eq!(body["runtime"]["engine"]["maxConcurrent"], 3);
+        // The health payload mirrors the engine defaults; assert against them
+        // instead of a literal so tuning the default does not break the test.
+        assert_eq!(
+            body["runtime"]["engine"]["maxConcurrent"],
+            the_standard::EngineConfig::default().max_concurrent
+        );
         assert_eq!(body["runtime"]["transport"]["maxResponseBytes"], 4_194_304);
         assert_eq!(body["runtime"]["transport"]["maxStreamBytes"], 4_194_304);
         assert_eq!(body["runtime"]["rules"]["refreshIntervalSeconds"], 300);
