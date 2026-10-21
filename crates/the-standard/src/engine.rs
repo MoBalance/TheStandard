@@ -25,6 +25,12 @@ use tokio::{
 };
 use ulid::Ulid;
 
+/// The numeric fingerprint asks a single response for 320 integers, so a slow
+/// upstream needs far more than the per-probe budget: at ~19 tokens/s that
+/// answer alone takes around 35 s. Without this floor the probe timed out and
+/// the report silently lost its attribution.
+const NUMERIC_FINGERPRINT_TIMEOUT_SECONDS: u64 = 90;
+
 pub trait RuntimeObserver: Send + Sync {
     fn emit(
         &self,
@@ -460,7 +466,17 @@ impl Engine {
         concurrency: &Semaphore,
         observer: Option<&dyn RuntimeObserver>,
     ) -> Result<ProbeObservation, CoreError> {
-        let deadline = Instant::now() + self.config.request_timeout;
+        // A numeric-fingerprint probe is one long completion rather than a small
+        // structural question, so it gets its own floor; the mode deadline still
+        // caps the whole detection.
+        let budget = if probe.kind == crate::ProbeKind::NumericFingerprint {
+            self.config
+                .request_timeout
+                .max(Duration::from_secs(NUMERIC_FINGERPRINT_TIMEOUT_SECONDS))
+        } else {
+            self.config.request_timeout
+        };
+        let deadline = Instant::now() + budget;
         let mut last_error = None;
         let mut backoff_count = 0;
         for attempt in 0..=self.config.max_retries {
