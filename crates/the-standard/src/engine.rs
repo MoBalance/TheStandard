@@ -3,6 +3,7 @@ use crate::{
     EvidenceCoverage, EvidenceSeverity, EvidenceStatus, OutboundProbe, PerformanceMetrics,
     ProbeObservation, ProbeRequest, ProbeTransport, Protocol, ReportSectionSelection,
     RuntimeEventStatus, UsageMetrics, Verdict, core_build_info,
+    fingerprint::prepare_fingerprint_request,
     knowledge::prepare_knowledge_request,
     model::mask_api_key,
     probe::{
@@ -169,6 +170,28 @@ impl Engine {
             "knowledge_resolution_completed",
             RuntimeEventStatus::Success,
             "Knowledge-pack resolution completed",
+            BTreeMap::new(),
+        );
+        emit_runtime(
+            observer.as_deref(),
+            "fingerprint",
+            "fingerprint_resolution_started",
+            RuntimeEventStatus::Running,
+            "Resolving the optional numeric model-fingerprint bank",
+            BTreeMap::new(),
+        );
+        tokio::time::timeout_at(
+            deadline,
+            prepare_fingerprint_request(self.config.rule_repository.as_ref(), &mut request),
+        )
+        .await
+        .map_err(|_| CoreError::OverallTimeout(timeout))?;
+        emit_runtime(
+            observer.as_deref(),
+            "fingerprint",
+            "fingerprint_resolution_completed",
+            RuntimeEventStatus::Success,
+            "Numeric fingerprint-bank resolution completed",
             BTreeMap::new(),
         );
         self.detect_inner(request, selection, transport, deadline, timeout, observer)
@@ -1050,6 +1073,46 @@ mod tests {
                 context: probe.context.clone(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_fingerprint_bank_reaches_the_identity_evidence() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../SanBiao");
+        let repository =
+            crate::RuleRepositoryConfig::new("http://127.0.0.1:1/manifest.json", None, false)
+                .unwrap()
+                .with_fallback_directory(Some(root));
+        let report = Engine::new(EngineConfig {
+            rule_repository: Some(repository),
+            ..EngineConfig::default()
+        })
+        .detect(
+            ProbeRequest {
+                base_url: "https://api.example.com".into(),
+                api_key: "sk-secret-value".into(),
+                model: "claude-sonnet-4-6".into(),
+                protocol: Protocol::Anthropic,
+                mode: ProbeMode::Quick,
+                parameters: Default::default(),
+                sections: Vec::new(),
+            },
+            &FixtureTransport,
+        )
+        .await
+        .expect("fixture detection succeeds");
+        let identity = report
+            .evidence
+            .iter()
+            .find(|item| item.name == "identity")
+            .expect("identity evidence");
+        // The fixture transport returns prose, so the second probe ran but no
+        // number could be parsed: the counts are reported, the attribution is
+        // marked inconclusive, and no model is claimed.
+        assert_eq!(identity.details["numericExpectedCount"], json!(320));
+        assert_eq!(identity.details["numericParsedCount"], json!(0));
+        assert_eq!(identity.details["attributionInconclusive"], json!(true));
+        assert!(!identity.details.contains_key("attributedModel"));
+        assert_eq!(report.performance.request_count, 8);
     }
 
     #[tokio::test]

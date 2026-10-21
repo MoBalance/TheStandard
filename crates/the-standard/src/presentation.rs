@@ -726,6 +726,81 @@ fn identity_section(report: &DetectionReport) -> PresentationSection {
             Some("pass".to_owned()),
         )
     });
+    // Numeric attribution: which reference model's number choices the endpoint
+    // reproduces. It is informational and never moves the identity verdict.
+    let inconclusive = flag("attributionInconclusive").unwrap_or(false);
+    if let Some(model) = text("attributedModel") {
+        fields.push(field(
+            "attributed-model",
+            "Attributed model",
+            json!(model),
+            "code",
+            None,
+            Some(
+                "The model whose numeric fingerprint best matches the endpoint's own number choices. Attribution is informational and never changes the verdict.",
+            ),
+            Some(if inconclusive { "warn" } else { "pass" }.to_owned()),
+        ));
+        if let Some(probability) = details
+            .get("attributionProbability")
+            .and_then(Value::as_f64)
+        {
+            fields.push(field(
+                "attribution-confidence",
+                "Attribution confidence",
+                percent(probability),
+                "percentage",
+                Some("%"),
+                Some("Softmax probability of the attributed model across the reference bank."),
+                None,
+            ));
+        }
+        if let Some(candidates) = details
+            .get("attributionCandidates")
+            .and_then(Value::as_array)
+        {
+            let listing = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    let model = candidate.get("model").and_then(Value::as_str)?;
+                    let family = candidate
+                        .get("family")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let probability = candidate
+                        .get("probability")
+                        .and_then(Value::as_f64)
+                        .unwrap_or_default();
+                    Some(format!("{model} ({family}) {:.1}%", probability * 100.0))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !listing.is_empty() {
+                fields.push(field(
+                    "attribution-candidates",
+                    "Attribution candidates",
+                    json!(listing),
+                    "text",
+                    None,
+                    Some("The best numeric-fingerprint matches with their probabilities."),
+                    None,
+                ));
+            }
+        }
+    }
+    if inconclusive {
+        fields.push(field(
+            "attribution-note",
+            "Attribution note",
+            json!(
+                "The numeric fingerprint was not conclusive: too few in-range numbers came back, or the best match stayed below 60% confidence."
+            ),
+            "text",
+            None,
+            None,
+            Some("warn".to_owned()),
+        ));
+    }
     if let Some(family) = text("expectedModelFamily") {
         fields.push(field(
             "observed-family",
@@ -1494,6 +1569,144 @@ mod tests {
                 .fields
                 .iter()
                 .all(|field| field.json_pointer != "/sections")
+        );
+    }
+
+    fn identity_report(
+        details: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> super::ReportPresentation {
+        let request = crate::ProbeRequest {
+            base_url: "https://api.example.com".into(),
+            api_key: "sk-test-secret".into(),
+            model: "claude-sonnet-4-6".into(),
+            protocol: crate::Protocol::Anthropic,
+            mode: crate::ProbeMode::Quick,
+            parameters: Default::default(),
+            sections: Vec::new(),
+        };
+        let identity = crate::DetectorEvidence {
+            name: "identity".into(),
+            display_name: "Model identity".into(),
+            category: crate::EvidenceCategory::Authenticity,
+            status: crate::EvidenceStatus::Pass,
+            severity: crate::EvidenceSeverity::Info,
+            basis: crate::EvidenceBasis::Inferred,
+            confidence: Some(0.8),
+            score: 100.0,
+            weight: 10.0,
+            summary: "identity fixture".into(),
+            details,
+        };
+        crate::Engine::default()
+            .report(request, vec![identity], Vec::new())
+            .presentation
+            .expect("presentation is present")
+    }
+
+    fn identity_section(
+        details: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> super::PresentationSection {
+        identity_report(details)
+            .views
+            .iter()
+            .find(|view| view.id == "overview")
+            .and_then(|view| {
+                view.sections
+                    .iter()
+                    .find(|section| section.id == "identity")
+            })
+            .cloned()
+            .expect("identity section")
+    }
+
+    #[test]
+    fn identity_section_renders_the_attributed_model() {
+        let details = std::collections::BTreeMap::from([
+            ("declaredModel".to_string(), json!("gpt-5.4")),
+            ("attributedModel".to_string(), json!("claude-sonnet-4-6")),
+            ("attributedFamily".to_string(), json!("claude")),
+            ("attributionProbability".to_string(), json!(0.6234)),
+            (
+                "attributionCandidates".to_string(),
+                json!([
+                    {"model": "claude-sonnet-4-6", "family": "claude", "probability": 0.6234, "similarity": 0.71},
+                    {"model": "claude-opus-5", "family": "claude", "probability": 0.2101, "similarity": 0.62}
+                ]),
+            ),
+            ("numericParsedCount".to_string(), json!(320)),
+            ("numericExpectedCount".to_string(), json!(320)),
+            ("attributionInconclusive".to_string(), json!(false)),
+        ]);
+        let section = identity_section(details);
+        let field = |key: &str| section.fields.iter().find(|field| field.key == key);
+
+        let attributed = field("attributed-model").expect("attributed model field");
+        assert_eq!(attributed.label, "Attributed model");
+        assert_eq!(attributed.value, json!("claude-sonnet-4-6"));
+        assert_eq!(attributed.format, "code");
+        assert_eq!(attributed.status.as_deref(), Some("pass"));
+
+        let confidence = field("attribution-confidence").expect("confidence field");
+        assert_eq!(confidence.value, json!(62.3));
+        assert_eq!(confidence.unit.as_deref(), Some("%"));
+        assert_eq!(confidence.format, "percentage");
+
+        let candidates = field("attribution-candidates").expect("candidates field");
+        let listing = candidates.value.as_str().unwrap();
+        assert!(listing.contains("claude-sonnet-4-6 (claude) 62.3%"));
+        assert!(listing.contains("claude-opus-5 (claude) 21.0%"));
+        assert!(field("attribution-note").is_none());
+
+        // The attribution sits directly below the upstream-reported model.
+        let keys = section
+            .fields
+            .iter()
+            .map(|field| field.key.as_str())
+            .collect::<Vec<_>>();
+        let upstream = keys.iter().position(|key| *key == "upstream-model");
+        let attributed = keys.iter().position(|key| *key == "attributed-model");
+        assert_eq!(attributed, upstream.map(|index| index + 1));
+    }
+
+    #[test]
+    fn identity_section_omits_attribution_without_a_numeric_bank() {
+        let section = identity_section(std::collections::BTreeMap::from([(
+            "declaredModel".to_string(),
+            json!("claude-sonnet-4-6"),
+        )]));
+        assert!(
+            section
+                .fields
+                .iter()
+                .all(|field| !field.key.starts_with("attribution"))
+        );
+        assert!(
+            section
+                .fields
+                .iter()
+                .any(|field| field.key == "upstream-model")
+        );
+    }
+
+    #[test]
+    fn inconclusive_attribution_warns_and_explains_itself() {
+        let section = identity_section(std::collections::BTreeMap::from([
+            ("attributedModel".to_string(), json!("beta-model")),
+            ("attributedFamily".to_string(), json!("beta")),
+            ("attributionProbability".to_string(), json!(0.31)),
+            ("attributionInconclusive".to_string(), json!(true)),
+        ]));
+        let field = |key: &str| section.fields.iter().find(|field| field.key == key);
+        assert_eq!(
+            field("attributed-model").unwrap().status.as_deref(),
+            Some("warn")
+        );
+        let note = field("attribution-note").expect("attribution note");
+        assert!(
+            note.value
+                .as_str()
+                .unwrap()
+                .contains("numeric fingerprint was not conclusive")
         );
     }
 }

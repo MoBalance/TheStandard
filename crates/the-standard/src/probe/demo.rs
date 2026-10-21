@@ -107,6 +107,9 @@ fn demo_text(probe: &OutboundProbe, _model: &str) -> String {
         | ProbeKind::WebSearch
         | ProbeKind::ReasoningIq
         | ProbeKind::ThinkingChain => probe.demo_response.clone().unwrap_or_default(),
+        // The demo target answers the numeric fingerprint probe with whatever
+        // the probe carries, which is nothing: attribution stays absent.
+        ProbeKind::NumericFingerprint => probe.demo_response.clone().unwrap_or_default(),
     }
 }
 

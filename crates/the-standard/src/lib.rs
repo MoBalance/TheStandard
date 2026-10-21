@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod fingerprint;
 pub mod knowledge;
 pub mod model;
 pub mod presentation;
@@ -23,8 +24,8 @@ pub use probe::{
     ReasoningBudgetStrategy,
 };
 pub use repository::{
-    RepositoryDocument, RepositoryFetch, RepositoryKnowledgePack, RepositoryTarget,
-    RuleRepositoryClient, RuleRepositoryError, RuleRepositoryManifest,
+    RepositoryDocument, RepositoryFetch, RepositoryFingerprintBank, RepositoryKnowledgePack,
+    RepositoryTarget, RuleRepositoryClient, RuleRepositoryError, RuleRepositoryManifest,
 };
 pub use rules::{
     CoreRuleBundle, ResolvedSections, RuleBundleError, SectionRule, SectionRules,

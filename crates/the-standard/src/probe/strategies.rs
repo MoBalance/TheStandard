@@ -3,6 +3,9 @@ use crate::{
     ContextAuditSample, ContextAuditSummary, ContextEchoStatus, ContextOverheadAssessment,
     ContextProbeMetadata, CoreError, DetectorEvidence, EvidenceBasis, EvidenceCategory,
     EvidenceSeverity, EvidenceStatus, ProbeKind, ProbeObservation, ProbeRequest, Protocol,
+    fingerprint::{
+        NUMERIC_PROBE_MAX_TOKENS, NUMERIC_PROBE_PROMPT, attribution_details, bank_from_request,
+    },
     rules::{IdentityProbeRules, ReasoningAttestationRules, rules_from_request},
     signature::{extract_text_fingerprint, similarity},
 };
@@ -37,7 +40,16 @@ impl ProbeStrategy for IdentityStrategy {
                 .replace("{family}", &family)
                 .replace("{provider}", &provider),
         );
-        Ok(vec![probe])
+        let mut probes = vec![probe];
+        // A resolved numeric bank earns a second identity observation. Without
+        // one the detector keeps its single probe and emits no attribution.
+        if bank_from_request(request).is_some() {
+            let mut numeric =
+                build_probe(request, ProbeKind::NumericFingerprint, NUMERIC_PROBE_PROMPT)?;
+            numeric.body["max_tokens"] = json!(NUMERIC_PROBE_MAX_TOKENS);
+            probes.push(numeric);
+        }
+        Ok(probes)
     }
 
     fn analyze(
@@ -49,7 +61,10 @@ impl ProbeStrategy for IdentityStrategy {
             return unavailable("identity", EvidenceCategory::Authenticity);
         };
         let evaluation = &rules.evaluation.identity;
-        let Some(observation) = observations.first() else {
+        let Some(observation) = observations
+            .iter()
+            .find(|observation| observation.kind == ProbeKind::Identity)
+        else {
             return skipped(
                 "identity",
                 &evaluation.display_name,
@@ -99,6 +114,18 @@ impl ProbeStrategy for IdentityStrategy {
         } else {
             0.0
         };
+        let mut details = BTreeMap::from([
+            ("declaredModel".into(), json!(declared_model)),
+            ("expectedModelFamily".into(), json!(expected_family)),
+            ("expectedProvider".into(), json!(expected_provider)),
+            ("metadataMatches".into(), json!(metadata_matches)),
+            ("selfReportMatches".into(), json!(self_report_matches)),
+            ("providerMatches".into(), json!(provider_matches)),
+            ("selfReport".into(), json!(observation.text)),
+        ]);
+        // Attribution is informational: it rides along with the identity
+        // details and never touches the score, the status or the severity.
+        details.extend(numeric_attribution(request, observations));
         evidence_with_basis(
             EvidenceSpec {
                 name: "identity",
@@ -119,15 +146,7 @@ impl ProbeStrategy for IdentityStrategy {
                     &evaluation.mismatch_summary
                 },
             },
-            BTreeMap::from([
-                ("declaredModel".into(), json!(declared_model)),
-                ("expectedModelFamily".into(), json!(expected_family)),
-                ("expectedProvider".into(), json!(expected_provider)),
-                ("metadataMatches".into(), json!(metadata_matches)),
-                ("selfReportMatches".into(), json!(self_report_matches)),
-                ("providerMatches".into(), json!(provider_matches)),
-                ("selfReport".into(), json!(observation.text)),
-            ]),
+            details,
             EvidenceBasis::Inferred,
             Some(evaluation.confidence),
         )
@@ -163,6 +182,27 @@ fn inferred_provider(model: &str, rules: Option<&IdentityProbeRules>) -> Option<
                 .find(|family| lower.contains(&family.marker))
         })
         .map(|family| family.provider.clone())
+}
+
+/// Numeric model attribution for the identity evidence.
+///
+/// Returns an empty map when no numeric bank was resolved or when the second
+/// probe did not run, so an unavailable bank never shows up as a zero or a
+/// null attribution.
+fn numeric_attribution(
+    request: &ProbeRequest,
+    observations: &[ProbeObservation],
+) -> BTreeMap<String, Value> {
+    let Some(bank) = bank_from_request(request) else {
+        return BTreeMap::new();
+    };
+    let Some(observation) = observations
+        .iter()
+        .find(|observation| observation.kind == ProbeKind::NumericFingerprint)
+    else {
+        return BTreeMap::new();
+    };
+    attribution_details(&bank, &observation.text)
 }
 
 impl ProbeStrategy for ReasoningAttestationStrategy {
@@ -1968,5 +2008,70 @@ mod tests {
         assert_eq!(evidence.status, EvidenceStatus::Warn);
         assert_eq!(evidence.severity, EvidenceSeverity::Major);
         assert_eq!(evidence.score, 52.0);
+    }
+
+    fn install_synthetic_bank(request: &mut ProbeRequest) {
+        request.parameters.insert(
+            crate::fingerprint::BANK_PARAMETER_KEY.into(),
+            serde_json::to_value(crate::fingerprint::fixtures::synthetic_bank()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_resolved_numeric_bank_adds_a_second_identity_probe() {
+        let mut request = request(ProbeMode::Standard);
+        assert_eq!(IdentityStrategy.build(&request).unwrap().len(), 1);
+
+        install_synthetic_bank(&mut request);
+        let probes = IdentityStrategy.build(&request).unwrap();
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].kind, ProbeKind::Identity);
+        assert_eq!(probes[1].kind, ProbeKind::NumericFingerprint);
+        assert_eq!(
+            probes[1].body["messages"][0]["content"],
+            json!(crate::fingerprint::NUMERIC_PROBE_PROMPT)
+        );
+        assert_eq!(
+            probes[1].body["max_tokens"],
+            json!(crate::fingerprint::NUMERIC_PROBE_MAX_TOKENS)
+        );
+    }
+
+    #[test]
+    fn numeric_attribution_never_changes_the_identity_score() {
+        let mut request = request(ProbeMode::Standard);
+        install_synthetic_bank(&mut request);
+        let identity = ProbeObservation::fixture(
+            ProbeKind::Identity,
+            200,
+            json!({"model": "claude-sonnet-4-6"}),
+            "I am Claude, provided by Anthropic.",
+        );
+        let baseline = IdentityStrategy.analyze(&request, std::slice::from_ref(&identity));
+        assert!(!baseline.details.contains_key("attributedModel"));
+
+        let numeric = ProbeObservation::fixture(
+            ProbeKind::NumericFingerprint,
+            200,
+            json!({}),
+            crate::fingerprint::fixtures::synthetic_sequence(1, 320),
+        );
+        let evidence = IdentityStrategy.analyze(&request, &[identity, numeric]);
+        assert_eq!(evidence.score, baseline.score);
+        assert_eq!(evidence.status, baseline.status);
+        assert_eq!(evidence.severity, baseline.severity);
+        assert_eq!(evidence.details["attributedModel"], json!("alpha-model"));
+        assert_eq!(evidence.details["attributedFamily"], json!("alpha"));
+        assert_eq!(evidence.details["numericParsedCount"], json!(320));
+        assert_eq!(evidence.details["numericExpectedCount"], json!(320));
+        assert_eq!(evidence.details["attributionInconclusive"], json!(false));
+        assert!(evidence.details["attributionProbability"].as_f64().unwrap() > 0.6);
+        assert_eq!(
+            evidence.details["attributionCandidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

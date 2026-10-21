@@ -159,6 +159,10 @@ pub struct ProbeRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ProbeKind {
     Identity,
+    /// Second identity observation: a numeric choice sequence the engine
+    /// compares with a reference model-fingerprint bank. Attribution is
+    /// informational and never changes the identity score.
+    NumericFingerprint,
     Behavior,
     ReasoningAttestation,
     ReasoningBudget,

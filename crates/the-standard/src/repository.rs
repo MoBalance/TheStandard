@@ -10,6 +10,7 @@ use wire_contracts::RuleRepositorySource;
 
 const REPOSITORY_SCHEMA_VERSION: u32 = 1;
 const MAX_KNOWLEDGE_PACKS: usize = 128;
+const MAX_FINGERPRINT_BANKS: usize = 8;
 const MAX_TARGETS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,10 @@ pub struct RuleRepositoryManifest {
     pub release: String,
     pub core_rules: RepositoryDocument,
     pub knowledge_packs: Vec<RepositoryKnowledgePack>,
+    /// Optional reference banks used for numeric model attribution. Manifests
+    /// published before the field existed simply omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fingerprint_banks: Vec<RepositoryFingerprintBank>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +45,22 @@ pub struct RepositoryKnowledgePack {
     pub path: String,
     pub digest: String,
     pub targets: Vec<RepositoryTarget>,
+}
+
+/// Descriptor of an optional numeric model-fingerprint bank.
+///
+/// `source` is descriptive provenance published by the repository and is not
+/// used for validation: the canonical digest is what binds the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryFingerprintBank {
+    pub id: String,
+    pub version: String,
+    pub channel: String,
+    pub path: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,7 +124,50 @@ impl RuleRepositoryManifest {
             }
             validate_targets(&pack.targets)?;
         }
+        if self.fingerprint_banks.len() > MAX_FINGERPRINT_BANKS {
+            return Err(RuleRepositoryError::Invalid(
+                "repository contains too many fingerprint banks",
+            ));
+        }
+        for bank in &self.fingerprint_banks {
+            let document = bank.document();
+            validate_document(&document)?;
+            if !identities.insert(document_identity(&document)) {
+                return Err(RuleRepositoryError::Invalid(
+                    "repository document identities must be unique",
+                ));
+            }
+            if !paths.insert(bank.path.as_str()) {
+                return Err(RuleRepositoryError::Invalid(
+                    "repository document paths must be unique",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Selects the fingerprint bank the engine should attribute against.
+    ///
+    /// A manifest that predates the field, or one that publishes no bank for
+    /// the requested channel, yields `None` and therefore no attribution.
+    pub fn select_fingerprint_bank<'a>(
+        &'a self,
+        channel: &str,
+        bank_id: Option<&str>,
+        version: Option<&str>,
+    ) -> Option<&'a RepositoryFingerprintBank> {
+        self.fingerprint_banks
+            .iter()
+            .filter(|bank| {
+                bank.channel == channel
+                    && bank_id.is_none_or(|id| bank.id == id)
+                    && version.is_none_or(|expected| bank.version == expected)
+            })
+            .max_by(|left, right| {
+                left.version
+                    .cmp(&right.version)
+                    .then(left.id.cmp(&right.id))
+            })
     }
 
     pub fn select_knowledge_pack<'a>(
@@ -143,6 +207,18 @@ impl RuleRepositoryManifest {
 }
 
 impl RepositoryKnowledgePack {
+    pub fn document(&self) -> RepositoryDocument {
+        RepositoryDocument {
+            id: self.id.clone(),
+            version: self.version.clone(),
+            channel: self.channel.clone(),
+            path: self.path.clone(),
+            digest: self.digest.clone(),
+        }
+    }
+}
+
+impl RepositoryFingerprintBank {
     pub fn document(&self) -> RepositoryDocument {
         RepositoryDocument {
             id: self.id.clone(),
@@ -568,5 +644,66 @@ mod tests {
                 .as_str()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn optional_fingerprint_banks_keep_older_manifests_valid() {
+        let mut raw: Value = serde_json::from_slice(&manifest_bytes()).unwrap();
+        raw["fingerprintBanks"] = Value::Array(Vec::new());
+        let manifest =
+            RuleRepositoryManifest::from_bytes(&serde_json::to_vec(&raw).unwrap(), 256 * 1024)
+                .unwrap();
+        assert!(manifest.fingerprint_banks.is_empty());
+        assert!(
+            manifest
+                .select_fingerprint_bank("stable", None, None)
+                .is_none()
+        );
+
+        // A manifest published before the field existed must parse unchanged.
+        let mut legacy: Value = serde_json::from_slice(&manifest_bytes()).unwrap();
+        legacy.as_object_mut().unwrap().remove("fingerprintBanks");
+        let manifest =
+            RuleRepositoryManifest::from_bytes(&serde_json::to_vec(&legacy).unwrap(), 256 * 1024)
+                .unwrap();
+        assert!(manifest.fingerprint_banks.is_empty());
+        assert_eq!(manifest.knowledge_packs.len(), 1);
+    }
+
+    #[test]
+    fn shared_fingerprint_bank_descriptor_matches_its_document() {
+        let manifest = RuleRepositoryManifest::from_bytes(&manifest_bytes(), 256 * 1024).unwrap();
+        let Some(bank) = manifest.select_fingerprint_bank("stable", None, None) else {
+            return;
+        };
+        assert_eq!(bank.id, "model-fingerprint-bank");
+        let document = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../SanBiao")
+            .join(&bank.path);
+        assert_eq!(
+            canonical_json_digest_bytes(&std::fs::read(document).unwrap()).unwrap(),
+            bank.digest
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_the_fingerprint_bank_from_the_local_fallback_directory() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../SanBiao");
+        let config = RuleRepositoryConfig::new("http://127.0.0.1:1/manifest.json", None, false)
+            .unwrap()
+            .with_fallback_directory(Some(root));
+        let client = RuleRepositoryClient::new(config, "repository-fingerprint-test").unwrap();
+        let manifest = client.fetch_manifest_with_source().await.unwrap();
+        let Some(bank) = manifest.value.select_fingerprint_bank("stable", None, None) else {
+            return;
+        };
+        let document = client
+            .fetch_document_with_source(&bank.document())
+            .await
+            .unwrap();
+        assert_eq!(document.source, RuleRepositorySource::LocalFallback);
+        let parsed: Value = serde_json::from_slice(&document.value).unwrap();
+        assert_eq!(parsed["id"], "model-fingerprint-bank");
+        assert!(parsed["numeric"]["models"].as_array().unwrap().len() >= 18);
     }
 }
