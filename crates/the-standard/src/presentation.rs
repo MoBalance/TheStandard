@@ -308,11 +308,20 @@ fn overview_view(report: &DetectionReport) -> PresentationView {
                     ),
                     field(
                         "model",
-                        "Target model",
+                        "Requested model",
                         json!(report.target.model),
                         "code",
                         None,
+                        Some("The model this detection asked for. Compare it with the model the upstream reported."),
                         None,
+                    ),
+                    field(
+                        "upstream-model",
+                        "Upstream-reported model",
+                        json!(upstream_model(report).unwrap_or_else(|| "not reported".to_owned())),
+                        "code",
+                        None,
+                        Some("The model id the upstream returned in the response body: what it says it is really serving."),
                         None,
                     ),
                     field(
@@ -646,6 +655,21 @@ fn percent(ratio: f64) -> Value {
     json!((ratio * 1000.0).round() / 10.0)
 }
 
+/// The model id the upstream returned in the response body, if the protocol
+/// carried one. Shared by the hero and the identity section so both show the
+/// same value.
+fn upstream_model(report: &DetectionReport) -> Option<String> {
+    report
+        .evidence
+        .iter()
+        .find(|item| item.name == "identity")
+        .and_then(|item| item.details.get("declaredModel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// "Is this really the model it claims to be?" — the question a relay check
 /// exists to answer, so it gets its own section instead of hiding in one cell of
 /// the evidence table. Every value is copied from the `identity` family; nothing
@@ -665,16 +689,43 @@ fn identity_section(report: &DetectionReport) -> PresentationSection {
     };
 
     let mut fields = vec![field(
-        "declared-model",
-        "Declared model",
+        "requested-model",
+        "Requested model",
         json!(report.target.model),
         "code",
         None,
-        Some(
-            "The model name the caller requested. It is the upstream's claim, not an observation.",
-        ),
+        Some("The model name this detection asked for. Echoing it back is not evidence."),
         None,
     )];
+    // The most informative identity signal the protocol carries: the model id the
+    // upstream itself puts in the response. Relays routinely answer with the real
+    // one even when the caller asked for something else.
+    let upstream_model = text("declaredModel").unwrap_or_default();
+    fields.push(if upstream_model.is_empty() {
+        field(
+            "upstream-model",
+            "Upstream-reported model",
+            json!("not reported"),
+            "text",
+            None,
+            Some(
+                "The response carried no model identifier, so the upstream made no claim to compare against.",
+            ),
+            Some("fail".to_owned()),
+        )
+    } else {
+        field(
+            "upstream-model",
+            "Upstream-reported model",
+            json!(upstream_model),
+            "code",
+            None,
+            Some(
+                "The model id the upstream returned in the response body: what it says it is really serving.",
+            ),
+            Some("pass".to_owned()),
+        )
+    });
     if let Some(family) = text("expectedModelFamily") {
         fields.push(field(
             "observed-family",
@@ -695,8 +746,25 @@ fn identity_section(report: &DetectionReport) -> PresentationSection {
             json!(provider),
             "code",
             None,
-            Some("Provider the response metadata points at."),
+            Some("Provider the response metadata and self-declaration point at."),
             None,
+        ));
+    }
+    if let Some(matches) = flag("providerMatches") {
+        fields.push(field(
+            "provider-match",
+            "Provider matches",
+            json!(if matches {
+                "agrees with the request"
+            } else {
+                "contradicts the request"
+            }),
+            "text",
+            None,
+            Some(
+                "Whether the model's own account of its provider agrees with the requested family.",
+            ),
+            tone(matches),
         ));
     }
     if let Some(matches) = flag("metadataMatches") {
